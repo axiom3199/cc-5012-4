@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>儿童歌曲跟唱字幕工具</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>儿童歌曲跟唱字幕工具</h1>
+    <div class="top-actions">
+      <button id="btnSample" type="button">载入内置测试样例</button>
+      <button id="btnAudio" type="button">选择音频…</button>
+      <span id="audioName" class="audio-name">未载入音频</span>
+      <button id="btnSave" type="button">保存工程</button>
+      <button id="btnLoadProj" type="button">打开工程</button>
+      <input id="fileProject" type="file" accept="application/json" hidden />
+      <button id="btnExport" type="button" class="primary">导出测试视频</button>
+      <span id="exportProgress" class="export-progress"></span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel left-panel">
+      <details open class="card">
+        <summary>1. 歌词编辑（歌词与时间数据分开存储）</summary>
+        <textarea id="lyricsInput" rows="7" spellcheck="false"
+          placeholder="每行一句，空格分词；中文可开启逐字拆分。换行与字号调整不会改动已确认的词时间。"></textarea>
+        <div class="row">
+          <label class="check"><input type="checkbox" id="chkSplitCJK" /> 中文逐字拆分</label>
+          <button id="btnApplyLyrics" type="button">应用歌词</button>
+          <span id="docStats" class="hint"></span>
+        </div>
+      </details>
+
+      <details open class="card">
+        <summary>2. 词句时间（无时间标签的词保持“待标”，不做字数平均推算）</summary>
+        <div class="row transport">
+          <button id="btnPlay" type="button">▶ 播放</button>
+          <input id="seek" type="range" min="0" max="1000" value="0" step="1" />
+          <span id="clock" class="clock">00:00.00 / --:--</span>
+        </div>
+        <div class="row">
+          <button id="btnMarkStart" type="button">标记当前词起点 I</button>
+          <button id="btnMarkEnd" type="button">标记当前词终点 O</button>
+          <button id="btnStamp" type="button" class="primary">打点（接上词终点→本词起点）</button>
+          <button id="btnClearTiming" type="button">清除该词时间</button>
+          <span id="stampHint" class="hint"></span>
+        </div>
+        <div class="row">
+          <label class="check"><input type="checkbox" id="chkCharMode" /> 逐字预览模式（需要逐字时间）</label>
+        </div>
+        <div id="timingTable" class="timing-table" tabindex="0"></div>
+      </details>
+
+      <details class="card">
+        <summary>3. 字体、字号与连字覆盖策略（变更后全部重新测量）</summary>
+        <div class="row wrap">
+          <label>字体
+            <select id="selFont">
+              <option value="rounded">圆体（含表情回退）</option>
+              <option value="hei">黑体（含表情回退）</option>
+              <option value="song">宋体（含表情回退）</option>
+            </select>
+          </label>
+          <label>字号
+            <input id="fontSize" type="range" min="32" max="96" value="56" />
+            <span id="fontSizeVal">56px</span>
+          </label>
+          <label>连字策略
+            <select id="selLigature">
+              <option value="atomic-if-merged">合并成一个字形 → 整组原子高亮</option>
+              <option value="prefix-cut">按测量前缀切割（不合并时才逐字）</option>
+            </select>
+          </label>
+        </div>
+        <div id="ligatureInfo" class="hint"></div>
+      </details>
+    </section>
+
+    <section class="panel right-panel">
+      <div class="preview-wrap">
+        <canvas id="stage" width="1280" height="720"></canvas>
+      </div>
+      <audio id="audio" preload="metadata"></audio>
+      <p class="hint preview-hint">
+        预览与导出共用同一 <code>renderAt(t)</code> 渲染路径；播放、拖动播放头与导出帧均以音频
+        <code>currentTime</code> 为唯一时间映射。
+      </p>
+    </section>
+  </main>
+
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>
