@@ -3,20 +3,21 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>儿童歌曲跟唱字幕工具</title>
+  <title>儿童歌曲跟唱字幕工具 · 对唱轮唱版</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <header class="topbar">
-    <h1>儿童歌曲跟唱字幕工具</h1>
+    <h1>儿童歌曲跟唱字幕工具 · 对唱 / 轮唱</h1>
     <div class="top-actions">
-      <button id="btnSample" type="button">载入内置测试样例</button>
+      <button id="btnSample" type="button">独唱测试样例</button>
+      <button id="btnDuet" type="button" class="primary">对唱轮唱样例</button>
       <button id="btnAudio" type="button">选择音频…</button>
       <span id="audioName" class="audio-name">未载入音频</span>
       <button id="btnSave" type="button">保存工程</button>
       <button id="btnLoadProj" type="button">打开工程</button>
       <input id="fileProject" type="file" accept="application/json" hidden />
-      <button id="btnExport" type="button" class="primary">导出测试视频</button>
+      <button id="btnExport" type="button">导出测试视频</button>
       <span id="exportProgress" class="export-progress"></span>
     </div>
   </header>
@@ -24,18 +25,22 @@
   <main class="layout">
     <section class="panel left-panel">
       <details open class="card">
-        <summary>1. 歌词编辑（歌词与时间数据分开存储）</summary>
-        <textarea id="lyricsInput" rows="7" spellcheck="false"
+        <summary>1. 歌词编辑（按声部分开，歌词与时间数据分开存储）</summary>
+        <div class="part-tabs" role="tablist">
+          <button type="button" class="part-tab" data-part="A">声部 A 歌词</button>
+          <button type="button" class="part-tab" data-part="B">声部 B 歌词</button>
+        </div>
+        <textarea id="lyricsInput" rows="6" spellcheck="false"
           placeholder="每行一句，空格分词；中文可开启逐字拆分。换行与字号调整不会改动已确认的词时间。"></textarea>
         <div class="row">
           <label class="check"><input type="checkbox" id="chkSplitCJK" /> 中文逐字拆分</label>
-          <button id="btnApplyLyrics" type="button">应用歌词</button>
+          <button id="btnApplyLyrics" type="button">应用当前声部歌词</button>
           <span id="docStats" class="hint"></span>
         </div>
       </details>
 
       <details open class="card">
-        <summary>2. 词句时间（无时间标签的词保持“待标”，不做字数平均推算）</summary>
+        <summary>2. 词句时间与声部归属（拖选多行后可整体切换声部）</summary>
         <div class="row transport">
           <button id="btnPlay" type="button">▶ 播放</button>
           <input id="seek" type="range" min="0" max="1000" value="0" step="1" />
@@ -44,18 +49,34 @@
         <div class="row">
           <button id="btnMarkStart" type="button">标记当前词起点 I</button>
           <button id="btnMarkEnd" type="button">标记当前词终点 O</button>
-          <button id="btnStamp" type="button" class="primary">打点（接上词终点→本词起点）</button>
+          <button id="btnStamp" type="button" class="primary">打点</button>
           <button id="btnClearTiming" type="button">清除该词时间</button>
-          <span id="stampHint" class="hint"></span>
         </div>
         <div class="row">
-          <label class="check"><input type="checkbox" id="chkCharMode" /> 逐字预览模式（需要逐字时间）</label>
+          <label class="check"><input type="checkbox" id="chkCharMode" /> 逐字跟唱预览（需要逐字时间）</label>
+        </div>
+        <div class="row assign-row">
+          <span class="hint">在下表按住鼠标拖选词实例，然后：</span>
+          <button id="btnAssignA" type="button">所选 → 声部 A</button>
+          <button id="btnAssignB" type="button">所选 → 声部 B</button>
+          <span id="assignHint" class="hint"></span>
         </div>
         <div id="timingTable" class="timing-table" tabindex="0"></div>
       </details>
 
+      <details open class="card">
+        <summary>3. 逐字跟唱校正（拖动音节边界，核验高亮区间与声音对应）</summary>
+        <div class="row">
+          <button id="btnStartCorrect" type="button">对当前选中词开始校正</button>
+          <span id="correctWord" class="hint"></span>
+        </div>
+        <div id="correctionStrip" class="correction-strip"><p class="hint">先在上方词表点选一个已标记时间的词，再开始校正。</p></div>
+        <div id="correctStatus" class="hint correct-status" role="status"></div>
+      </details>
+
       <details class="card">
-        <summary>3. 字体、字号与连字覆盖策略（变更后全部重新测量）</summary>
+        <summary>4. 声部显示、字体与布局（视图切换不改原始时序）</summary>
+        <div id="partViewPanel" class="part-view-panel"></div>
         <div class="row wrap">
           <label>字体
             <select id="selFont">
@@ -65,8 +86,8 @@
             </select>
           </label>
           <label>字号
-            <input id="fontSize" type="range" min="32" max="96" value="56" />
-            <span id="fontSizeVal">56px</span>
+            <input id="fontSize" type="range" min="28" max="80" value="44" />
+            <span id="fontSizeVal">44px</span>
           </label>
           <label>连字策略
             <select id="selLigature">
@@ -75,6 +96,8 @@
             </select>
           </label>
         </div>
+        <div id="layoutInfo" class="hint">布局版本 v1</div>
+        <div id="conflictBox" class="conflict-box" hidden></div>
         <div id="ligatureInfo" class="hint"></div>
       </details>
     </section>
@@ -85,8 +108,8 @@
       </div>
       <audio id="audio" preload="metadata"></audio>
       <p class="hint preview-hint">
-        预览与导出共用同一 <code>renderAt(t)</code> 渲染路径；播放、拖动播放头与导出帧均以音频
-        <code>currentTime</code> 为唯一时间映射。
+        预览与导出共用同一 <code>renderAt(t)</code> 渲染路径；两个声部各自保留词实例、时间与颜色，
+        同时演唱时各自高亮，绝不排成单线程字幕。导出固定当前声部选择与布局版本，后台晚到的结果不会覆盖更新后的预览。
       </p>
     </section>
   </main>

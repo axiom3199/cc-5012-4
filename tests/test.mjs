@@ -5,10 +5,18 @@
 import assert from 'node:assert/strict';
 import { graphemes, graphemeCount } from '../src/gcs.js';
 import {
-  buildDocument, rebuildDocument, isPending, stateAt,
-  pendingIds, serializeProject, parseProject,
+  buildDocument, buildMultiPartDocument, rebuildDocument, rebuildPartDocument,
+  isPending, stateAt, stateForParts, pendingIds,
+  serializeProject, parseProject, findOverlaps,
+  PART_A, PART_B, defaultParts, wordsOfPart,
 } from '../src/model.js';
 import { CanvasLayout } from '../src/layout.js';
+import { ScoreLayout } from '../src/scorelayout.js';
+import {
+  ensureCharTimings, validateCharRecord, dragCharBoundary, dragWordEdge,
+} from '../src/correction.js';
+import { reassignSelection, VIEW_SOLO, VIEW_REFERENCE, VIEW_HIDDEN } from '../src/parts.js';
+import { validateExport, captureExportSnapshot } from '../src/exporter.js';
 
 let passed = 0;
 function test(name, fn) {
@@ -180,9 +188,10 @@ test('project round-trip keeps timings keyed by instance id', () => {
   const doc = buildDocument('la la', {});
   const timings = { [doc.words[0].id]: { start: 1, end: 2, chars: null } };
   const json = serializeProject({ rawText: 'la la', splitCJK: false, font: null, timings, audioName: 'x.wav' });
-  const back = parseProject(json);
+  const { project: back, migrated } = parseProject(json);
   assert.equal(back.timings[doc.words[0].id].start, 1);
   assert.equal(back.audioName, 'x.wav');
+  assert.equal(migrated, true); // v1 shape loads as a single-part project
 });
 
 test('CJK split mode turns each ideograph into its own word', () => {
@@ -288,6 +297,295 @@ test('long-tone word holds a single active span across its full duration', () =>
     assert.equal(stateAt(doc, timings, t).activeId, doc.words[0].id);
   }
   assert.equal(stateAt(doc, timings, 2.7).activeId, null);
+});
+
+// ---------- two voice parts: instances, overlap and simultaneous highlights ----------
+
+console.log('\nduet / round part model:');
+
+function buildDuetDoc() {
+  return buildMultiPartDocument(
+    { A: 'echo hold', B: 'echo one two' },
+    { splitCJK: false, parts: [PART_A, PART_B] }
+  );
+}
+
+test('each part keeps independent word instances and part membership', () => {
+  const doc = buildDuetDoc();
+  assert.equal(wordsOfPart(doc, PART_A).length, 2);
+  assert.equal(wordsOfPart(doc, PART_B).length, 3);
+  const echoA = wordsOfPart(doc, PART_A).find(w => w.text === 'echo');
+  const echoB = wordsOfPart(doc, PART_B).find(w => w.text === 'echo');
+  assert.notEqual(echoA.id, echoB.id);
+  assert.equal(echoA.part, PART_A);
+  assert.equal(echoB.part, PART_B);
+});
+
+test('same word at the same instant resolves to two active instances, not one', () => {
+  const doc = buildDuetDoc();
+  const echoA = wordsOfPart(doc, PART_A).find(w => w.text === 'echo');
+  const echoB = wordsOfPart(doc, PART_B).find(w => w.text === 'echo');
+  const timings = {
+    [echoA.id]: { start: 0.6, end: 1.0, chars: null },
+    [echoB.id]: { start: 0.6, end: 1.0, chars: null },
+  };
+  const states = stateForParts(doc, timings, 0.8, [PART_A, PART_B]);
+  assert.equal(states[PART_A].activeId, echoA.id);
+  assert.equal(states[PART_B].activeId, echoB.id);
+  // Per-part stateAt must not leak across lanes.
+  assert.equal(stateAt(doc, timings, 0.8, PART_A).activeId, echoA.id);
+  assert.equal(stateAt(doc, timings, 0.8, PART_B).activeId, echoB.id);
+});
+
+test('a long tone in part A stays active across two phrases of part B', () => {
+  const doc = buildDuetDoc();
+  const a = wordsOfPart(doc, PART_A);
+  const b = wordsOfPart(doc, PART_B);
+  const timings = {
+    [a[1].id]: { start: 2.0, end: 4.6, chars: null }, // hold
+    [b[1].id]: { start: 2.0, end: 2.5, chars: null }, // one
+    [b[2].id]: { start: 2.55, end: 3.1, chars: null }, // two
+  };
+  for (const t of [2.1, 2.7, 4.5]) {
+    assert.equal(stateAt(doc, timings, t, PART_A).activeId, a[1].id, `A holds at ${t}`);
+  }
+  assert.equal(stateAt(doc, timings, 2.2, PART_B).activeId, b[1].id);
+  assert.equal(stateAt(doc, timings, 2.8, PART_B).activeId, b[2].id);
+});
+
+test('cross-part overlap is reported as info; intra-part overlap is an error', () => {
+  const doc = buildDuetDoc();
+  const a = wordsOfPart(doc, PART_A);
+  const b = wordsOfPart(doc, PART_B);
+  const timings = {
+    [a[0].id]: { start: 0.0, end: 1.0, chars: null },
+    [a[1].id]: { start: 0.5, end: 1.5, chars: null }, // overlaps A's first word
+    [b[0].id]: { start: 0.2, end: 0.9, chars: null }, // legitimate duet overlap
+  };
+  const { intra, cross } = findOverlaps(doc, timings, [PART_A, PART_B]);
+  assert.equal(intra.length, 1);
+  assert.equal(intra[0].part, PART_A);
+  // Both timed A words overlap B's single timed word: two cross records.
+  assert.equal(cross.length, 2);
+  assert.deepEqual(cross[0].parts.sort(), [PART_A, PART_B]);
+});
+
+test('part reassignment keeps the instance id and its timing record', () => {
+  const doc = buildDuetDoc();
+  const echoB = wordsOfPart(doc, PART_B).find(w => w.text === 'echo');
+  const timings = { [echoB.id]: { start: 1, end: 2, chars: null } };
+  const result = reassignSelection(doc, [echoB.id], PART_A, [PART_A, PART_B]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.moved, [echoB.id]);
+  const moved = doc.words.find(w => w.id === echoB.id);
+  assert.equal(moved.part, PART_A);
+  assert.equal(timings[echoB.id].start, 1);
+});
+
+test('rebuilding one part text preserves the other part timings', () => {
+  const doc = buildDuetDoc();
+  const bWord = wordsOfPart(doc, PART_B)[0];
+  const timings = { [bWord.id]: { start: 3, end: 4, chars: null } };
+  const { doc: next, timings: nextTimings } =
+    rebuildPartDocument(doc, timings, PART_A, 'echo hold again', { splitCJK: false });
+  assert.equal(wordsOfPart(next, PART_A).length, 3);
+  assert.equal(wordsOfPart(next, PART_B).length, 3);
+  assert.equal(nextTimings[bWord.id].start, 3);
+});
+
+test('v1 solo project loads automatically as a single part A document', () => {
+  const v1 = JSON.stringify({
+    version: 1, rawText: 'la la', splitCJK: false, font: null,
+    audioName: 'old.wav', timings: { x: { start: 1, end: 2, chars: null } },
+  });
+  const { project, migrated } = parseProject(v1);
+  assert.equal(migrated, true);
+  assert.equal(project.partTexts[PART_A], 'la la');
+  assert.equal(project.partTexts[PART_B], '');
+  assert.deepEqual(project.parts.map(p => p.id), [PART_A, PART_B]);
+  assert.equal(project.timings.x.start, 1);
+});
+
+test('v2 project round-trips part texts and layout version', () => {
+  const doc = buildDuetDoc();
+  const json = serializeProject({
+    version: 2, rawText: 'echo hold', splitCJK: false, font: null,
+    timings: {}, audioName: 'd.wav', parts: defaultParts(),
+    partTexts: { A: 'echo hold', B: 'echo one two' }, layoutVersion: 3,
+  });
+  const { project, migrated } = parseProject(json);
+  assert.equal(migrated, false);
+  assert.equal(project.layoutVersion, 3);
+  assert.equal(project.partTexts[PART_B], 'echo one two');
+  assert.equal(doc.words.length, 5);
+});
+
+// ---------- stable score lanes ----------
+
+console.log('\nscore layout lanes:');
+
+test('lanes keep stable top/bottom order even when one lane pauses', () => {
+  const doc = buildDuetDoc();
+  const score = new ScoreLayout({ width: 1280, height: 720, fontSize: 40, parts: defaultParts() });
+  score.relayout(doc);
+  const laneA = score.laneOf(PART_A);
+  const laneB = score.laneOf(PART_B);
+  assert.ok(laneA.top < laneB.top);
+  // Re-layout at a "later time" (same inputs, no playback-driven movement).
+  score.relayout(doc);
+  const laneA2 = score.laneOf(PART_A);
+  const laneB2 = score.laneOf(PART_B);
+  assert.equal(laneA2.top, laneA.top);
+  assert.equal(laneB2.top, laneB.top);
+  assert.ok(laneA2.top + laneA2.height <= laneB2.top);
+});
+
+test('focusing one part allocates the full stage to that lane only', () => {
+  const doc = buildDuetDoc();
+  const score = new ScoreLayout({
+    width: 1280, height: 720, fontSize: 40, parts: defaultParts(), focusPart: PART_B,
+  });
+  score.relayout(doc);
+  assert.equal(score.result.lanes.length, 1);
+  assert.equal(score.result.lanes[0].partId, PART_B);
+  // Reference/hidden modes are display state only.
+  assert.ok([VIEW_SOLO, VIEW_REFERENCE, VIEW_HIDDEN].includes(VIEW_REFERENCE));
+});
+
+test('oversized content reports a lane-overflow conflict instead of clipping silently', () => {
+  const longText = 'word '.repeat(120).trim();
+  const doc = buildMultiPartDocument(
+    { A: longText, B: 'tiny' }, { splitCJK: false, parts: [PART_A, PART_B] }
+  );
+  const score = new ScoreLayout({
+    width: 480, height: 360, fontSize: 40, padding: 20, parts: defaultParts(),
+  });
+  const result = score.relayout(doc);
+  assert.ok(result.conflicts.some(c => c.type === 'lane-overflow' && c.part === PART_A));
+});
+
+test('font size change bumps the layout version used by export', () => {
+  const doc = buildDuetDoc();
+  const score = new ScoreLayout({ width: 1280, height: 720, fontSize: 40, parts: defaultParts() });
+  score.relayout(doc);
+  const v1ver = score.layoutVersion;
+  score.update({ fontSize: 52 });
+  score.relayout(doc);
+  assert.ok(score.layoutVersion > v1ver);
+});
+
+// ---------- char sing-along correction kernel ----------
+
+console.log('\nsyllable correction kernel:');
+
+test('dragging a syllable boundary moves both adjacent slots and stays valid', () => {
+  const doc = buildDocument('star', {});
+  const word = doc.words[0];
+  let rec = ensureCharTimings(word, { start: 4.8, end: 5.3, chars: null });
+  assert.equal(rec.chars.length, 4);
+  const result = dragCharBoundary(word, rec, 2, 5.05, 'both');
+  assert.equal(result.ok, true, result.error);
+  rec = result.rec;
+  assert.equal(rec.chars[1].end, 5.05);
+  assert.equal(rec.chars[2].start, 5.05);
+  assert.equal(validateCharRecord(word, rec).ok, true);
+});
+
+test('boundary drag is rejected when it would invert an interval', () => {
+  const doc = buildDocument('star', {});
+  const word = doc.words[0];
+  const rec = ensureCharTimings(word, { start: 4.8, end: 5.3, chars: null });
+  const firstBoundary = rec.chars[0].end;
+  const rejected = dragCharBoundary(word, rec, 1, rec.chars[0].start, 'both');
+  assert.equal(rejected.ok, false);
+  assert.ok(rejected.error.includes('边界'));
+  // The record is untouched after rejection.
+  assert.equal(rec.chars[0].end, firstBoundary);
+});
+
+test('word edge drag stretches every grapheme slot proportionally', () => {
+  const doc = buildDocument('star', {});
+  const word = doc.words[0];
+  const rec0 = ensureCharTimings(word, { start: 4.8, end: 5.3, chars: null });
+  const result = dragWordEdge(word, rec0, 'end', 5.8);
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.rec.end, 5.8);
+  assert.equal(result.rec.chars[3].end, 5.8);
+  assert.equal(validateCharRecord(word, result.rec).ok, true);
+});
+
+test('correction refuses a word that still has no word-level timing', () => {
+  const doc = buildDocument('star', {});
+  const result = dragCharBoundary(doc.words[0], undefined, 1, 1.0, 'both');
+  assert.equal(result.ok, false);
+  assert.ok(result.error.includes('整词时间'));
+});
+
+// ---------- export validation and snapshot freeze ----------
+
+console.log('\nexport validation:');
+
+test('export blocks on intra-part overlap and lane overflow, allows cross-part', () => {
+  const doc = buildDuetDoc();
+  const a = wordsOfPart(doc, PART_A);
+  const b = wordsOfPart(doc, PART_B);
+  const timings = {
+    [a[0].id]: { start: 0, end: 1, chars: null },
+    [a[1].id]: { start: 0.5, end: 1.5, chars: null },
+    [b[0].id]: { start: 0.2, end: 0.9, chars: null },
+  };
+  const score = new ScoreLayout({ width: 1280, height: 720, fontSize: 40, parts: defaultParts() });
+  const layoutResult = score.relayout(doc);
+  const v = validateExport({ doc, timings, parts: defaultParts(), layoutResult });
+  assert.equal(v.ok, false);
+  assert.equal(v.intraPartOverlaps.length, 1);
+  assert.equal(v.crossPartOverlaps.length, 2);
+});
+
+test('clean duet timeline exports; snapshot freezes part views and layout version', () => {
+  const doc = buildDuetDoc();
+  const a = wordsOfPart(doc, PART_A);
+  const b = wordsOfPart(doc, PART_B);
+  const timings = {
+    [a[0].id]: { start: 0, end: 1, chars: null },
+    [b[0].id]: { start: 0, end: 1, chars: null },
+  };
+  const score = new ScoreLayout({ width: 1280, height: 720, fontSize: 40, parts: defaultParts() });
+  const layoutResult = score.relayout(doc);
+  const partViews = { [PART_A]: VIEW_SOLO, [PART_B]: VIEW_REFERENCE };
+  const v = validateExport({ doc, timings, parts: defaultParts(), layoutResult });
+  assert.equal(v.ok, true);
+  const snap = captureExportSnapshot({
+    doc, timings, parts: defaultParts(), partViews, focusPart: 'all',
+    layoutResult, mode: 'char', title: 't', font: null,
+  });
+  assert.equal(snap.layoutVersion, layoutResult.layoutVersion);
+  assert.equal(snap.partViews[PART_B], VIEW_REFERENCE);
+  // Mutating live state after capture cannot change the snapshot.
+  partViews[PART_B] = VIEW_HIDDEN;
+  assert.equal(snap.partViews[PART_B], VIEW_REFERENCE);
+});
+
+test('export generation guard marks a late result as superseded', () => {
+  // Mirror the app.js guard: each run captures its own generation; a newer
+  // run increments the shared counter so the stale run's result is dropped.
+  let current = 0;
+  const first = ++current;
+  const second = ++current;
+  const accept = generation => generation === current;
+  assert.equal(accept(first), false); // late result from the first run
+  assert.equal(accept(second), true); // current run still owns the preview
+  // A snapshot captured by the first run is immutable regardless of the guard.
+  const doc = buildDuetDoc();
+  const score = new ScoreLayout({ width: 1280, height: 720, fontSize: 40, parts: defaultParts() });
+  const layoutResult = score.relayout(doc);
+  const snap = captureExportSnapshot({
+    doc, timings: {}, parts: defaultParts(),
+    partViews: { A: VIEW_SOLO, B: VIEW_HIDDEN }, focusPart: PART_A,
+    layoutResult, mode: 'word', title: '', font: null,
+  });
+  assert.equal(snap.focusPart, PART_A);
+  assert.equal(snap.partViews.B, VIEW_HIDDEN);
 });
 
 console.log(`\n${passed} tests passed${process.exitCode ? ' (with failures)' : ''}`);

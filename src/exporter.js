@@ -7,8 +7,14 @@
 // highlight resolution. A canvas.captureStream(fps) supplies the video track
 // while a MediaStreamDestination on the shared AudioContext supplies the
 // audio track, so audio, frame clock and highlight clock cannot drift apart.
+//
+// An export runs from a frozen snapshot (part selection, view modes and layout
+// version). Toggling parts or editing the layout while the recorder runs
+// cannot change the output, and a result arriving after a newer export was
+// started is rejected by the caller via the generation guard in app.js.
 
 import { renderAt } from './renderer.js';
+import { findOverlaps } from './model.js';
 
 function pickMimeType() {
   const candidates = [
@@ -29,9 +35,52 @@ export function isExportSupported() {
     'captureStream' in HTMLCanvasElement.prototype;
 }
 
+// Pre-export validation. Intra-part timeline overlaps and unresolved layout
+// conflicts block the export with the actual conflict data; cross-part
+// overlaps are legitimate duet content and never block.
+export function validateExport({ doc, timings, parts, layoutResult }) {
+  const errors = [];
+  const { intra, cross } = findOverlaps(doc, timings, parts.map(p => p.id));
+  for (const c of intra) {
+    errors.push(`声部 ${c.part} 时间重叠：“${c.a.text}”与“${c.b.text}”在 ${c.start.toFixed(2)}–${c.end.toFixed(2)}s 同时演唱`);
+  }
+  for (const c of (layoutResult?.conflicts || [])) {
+    errors.push(c.message);
+  }
+  return {
+    ok: errors.length === 0,
+    errors,
+    crossPartOverlaps: cross,
+    intraPartOverlaps: intra,
+    layoutConflicts: layoutResult?.conflicts || [],
+  };
+}
+
+// Freeze everything that identifies the rendered output. The same object is
+// passed to renderAt during export and can be saved as a sidecar manifest.
+export function captureExportSnapshot({
+  doc, timings, parts, partViews, focusPart,
+  layoutResult, mode, title, font,
+}) {
+  return {
+    version: 2,
+    exportedAt: new Date().toISOString(),
+    layoutVersion: layoutResult.layoutVersion,
+    focusPart,
+    partViews: JSON.parse(JSON.stringify(partViews)),
+    parts: parts.map(p => ({ ...p })),
+    mode,
+    title,
+    font: font ? { ...font } : null,
+    wordCount: doc.words.length,
+    timingIds: Object.keys(timings).sort(),
+  };
+}
+
 export async function exportTestVideo({
   canvas, audio, layout, doc, timings,
   mode, title, fps = 30, onProgress,
+  parts = null, partViews = null,
 }) {
   if (!isExportSupported()) {
     throw new Error('当前浏览器不支持 MediaRecorder / captureStream，无法导出视频');
@@ -54,8 +103,10 @@ export async function exportTestVideo({
   recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
 
   const duration = audio.duration;
+  // partViews/parts come from the frozen snapshot; live view toggles during
+  // recording cannot reach the renderer.
   const paint = t => renderAt(ctx, {
-    layout, doc, timings, time: t, mode, title, duration,
+    layout, doc, timings, time: t, mode, title, duration, parts, partViews,
   });
 
   return new Promise((resolve, reject) => {
@@ -73,7 +124,7 @@ export async function exportTestVideo({
 
     audio.seek(0);
     // Paint the t=0 frame before recording starts so the first captured
-    // frame already shows the correct (pending or first-word) state.
+    // frame already shows the correct state.
     paint(0);
 
     recorder.start(200);

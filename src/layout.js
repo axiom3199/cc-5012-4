@@ -67,6 +67,8 @@ export class CanvasLayout {
     this.lineHeightMul = opts.lineHeightMul ?? 1.55;
     // 'atomic-if-merged' (default) or 'prefix-cut'
     this.ligaturePolicy = opts.ligaturePolicy ?? 'atomic-if-merged';
+    // Fixed top offset for the first visual line; used by per-part lanes.
+    this.top = opts.top ?? null;
     this._ctx = makeCtx();
     this._measureCache = new Map();
     this.result = { visualLines: [], words: [], totalHeight: 0, fonts: '' };
@@ -74,7 +76,7 @@ export class CanvasLayout {
 
   update(patch = {}) {
     let fontChanged = false;
-    for (const key of ['width', 'height', 'padding', 'fontFamily', 'fontSize', 'lineHeightMul', 'ligaturePolicy']) {
+    for (const key of ['width', 'height', 'padding', 'fontFamily', 'fontSize', 'lineHeightMul', 'ligaturePolicy', 'top']) {
       if (key in patch && patch[key] !== this[key]) {
         this[key] = patch[key];
         if (key === 'fontFamily' || key === 'fontSize') fontChanged = true;
@@ -203,7 +205,7 @@ export class CanvasLayout {
 
     // Second pass: center each visual line and assign absolute coordinates.
     const totalHeight = visualLines.length * lineHeightPx;
-    const startY = Math.max(this.padding, (this.height - totalHeight) / 2);
+    const startY = this.top ?? Math.max(this.padding, (this.height - totalHeight) / 2);
     const placedWords = [];
 
     visualLines.forEach((items, li) => {
